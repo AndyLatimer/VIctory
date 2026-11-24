@@ -87,7 +87,8 @@ pub fn mount_at(letter: char, root: &Path) {
 fn root_wide(root: &Path) -> Vec<u16> {
     let root = std::path::absolute(root).unwrap_or_else(|_| root.to_owned());
     let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
-    while wide.len() > 3 && wide.last().is_some_and(|c| SEPARATORS.contains(c)) {
+    let min = if wide.starts_with(&VERBATIM) { 7 } else { 3 };
+    while wide.len() > min && wide.last().is_some_and(|c| SEPARATORS.contains(c)) {
         wide.pop();
     }
     wide
@@ -132,6 +133,9 @@ fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
         out.push(backslash);
         out.extend_from_slice(part);
     }
+    if out.last() == Some(&u16::from(b':')) {
+        out.push(backslash);
+    }
     out
 }
 
@@ -153,17 +157,35 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
     let drives = drives();
     let (_, root) = drives.iter().find(|(l, _)| *l == letter)?;
     let tail = &rest[2..];
-    if prefix.is_empty() && root.len() + tail.len() >= LONG {
+    if root.starts_with(&VERBATIM) || (prefix.is_empty() && root.len() + tail.len() >= LONG) {
         let mut out = verbatim(root, tail);
         out.push(0);
         return Some(out);
     }
-    let mut out = prefix.to_vec();
-    out.extend_from_slice(root);
-    // `X:` and `X:name` are relative to the root.
-    if !tail.first().is_some_and(|c| SEPARATORS.contains(c)) {
-        out.push(b'\\'.into());
-    }
+    let mut out = if !prefix.is_empty() {
+        let backslash = u16::from(b'\\');
+        if let Some(unc) = root.strip_prefix(&[backslash; 2][..]) {
+            let mut out = VERBATIM.to_vec();
+            out.extend("UNC\\".encode_utf16());
+            out.extend_from_slice(unc);
+            out
+        } else {
+            [prefix, root].concat()
+        }
+    } else {
+        root.to_vec()
+    };
+    // `X:` and `X:name` are relative to the root; avoid doubling separators
+    // when `root` itself ends with one (e.g. a drive root `C:\`).
+    let root_sep = out.last().is_some_and(|c| SEPARATORS.contains(c));
+    let tail = if root_sep && tail.first().is_some_and(|c| SEPARATORS.contains(c)) {
+        &tail[1..]
+    } else {
+        if !root_sep && !tail.first().is_some_and(|c| SEPARATORS.contains(c)) {
+            out.push(b'\\'.into());
+        }
+        tail
+    };
     let verbatim = !prefix.is_empty();
     out.extend(tail.iter().map(|&c| {
         if verbatim && c == u16::from(b'/') {
@@ -412,6 +434,59 @@ pub extern "system" fn GetDiskFreeSpaceExW(
     )
 }
 
+/// Volume root (`C:\` or `\\server\share\`, NUL-terminated) of a translated
+/// host path, whether plain, verbatim (`\\?\`), or UNC.
+fn volume_root(host: &[u16]) -> Option<Vec<u16>> {
+    let path = host.strip_suffix(&[0]).unwrap_or(host);
+    let backslash = u16::from(b'\\');
+    if let Some(rest) = path.strip_prefix(&VERBATIM[..]) {
+        if rest.len() >= 4
+            && rest[3] == backslash
+            && rest[..3]
+                .iter()
+                .zip(b"UNC")
+                .all(|(&a, &b)| u8::try_from(a).is_ok_and(|c| c.eq_ignore_ascii_case(&b)))
+        {
+            return unc_volume_root(&rest[4..]);
+        }
+        return drive_volume_root(rest);
+    }
+    if let Some(unc) = path.strip_prefix(&[backslash, backslash]) {
+        return unc_volume_root(unc);
+    }
+    drive_volume_root(path)
+}
+
+fn drive_volume_root(path: &[u16]) -> Option<Vec<u16>> {
+    let &[letter, colon, ..] = path else {
+        return None;
+    };
+    if colon != u16::from(b':') || !u8::try_from(letter).is_ok_and(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    if path.len() > 2 && !SEPARATORS.contains(&path[2]) {
+        return None;
+    }
+    Some(vec![letter, colon, u16::from(b'\\'), 0])
+}
+
+fn unc_volume_root(unc: &[u16]) -> Option<Vec<u16>> {
+    let backslash = u16::from(b'\\');
+    let mut parts = unc
+        .split(|c| SEPARATORS.contains(c))
+        .filter(|p| !p.is_empty());
+    let server = parts.next()?;
+    let share = parts.next()?;
+    let mut out = Vec::with_capacity(2 + server.len() + 1 + share.len() + 2);
+    out.extend_from_slice(&[backslash, backslash]);
+    out.extend_from_slice(server);
+    out.push(backslash);
+    out.extend_from_slice(share);
+    out.push(backslash);
+    out.push(0);
+    Some(out)
+}
+
 /// Wants a volume root: a virtual drive answers for the host volume its
 /// folder is on.
 pub extern "system" fn GetDiskFreeSpaceW(
@@ -423,11 +498,9 @@ pub extern "system" fn GetDiskFreeSpaceW(
 ) -> i32 {
     let mut p = wide(root);
     if let Some(host) = &mut p.1
-        && let [letter, colon, sep, ..] = host[..]
-        && colon == u16::from(b':')
-        && SEPARATORS.contains(&sep)
+        && let Some(vol) = volume_root(host)
     {
-        *host = vec![letter, colon, sep, 0];
+        *host = vol;
     }
     host!("kernel32.dll", "GetDiskFreeSpaceW": extern "system" fn(*const u16, *mut u32, *mut u32, *mut u32, *mut u32) -> i32)(
         p.ptr(),
@@ -937,5 +1010,190 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["present.txt"]);
+    }
+
+    #[test]
+    fn verbatim_host_roots_translate_and_open_on_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(
+            canonical.to_string_lossy().starts_with(r"\\?\"),
+            "canonicalize on Windows yields a verbatim path: {}",
+            canonical.display()
+        );
+        let letter = mount(&canonical).unwrap();
+        let close = host!("kernel32.dll", "CloseHandle": extern "system" fn(Handle) -> i32);
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const CREATE_ALWAYS: u32 = 2;
+        let null = std::ptr::null_mut();
+
+        // Forward slashes in a title path under a verbatim host root must be
+        // converted to backslashes, or Windows rejects the `\\?\` path.
+        let slash = w(&format!("{letter}:/from_slash.bin"));
+        let h = CreateFileW(
+            slash.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            null,
+            CREATE_ALWAYS,
+            0,
+            null,
+        );
+        assert_ne!(
+            h as isize,
+            -1,
+            "CreateFileW failed for forward-slash path under verbatim root: {:?}",
+            translate(&slash[..slash.len() - 1]).map(|v| text(&v))
+        );
+        close(h);
+        assert!(dir.path().join("from_slash.bin").is_file());
+
+        // An extended title path under a verbatim host root must not get a
+        // doubled `\\?\` prefix (`\\?\\\?\...`).
+        let extended = w(&format!(r"\\?\{letter}:\from_ext.bin"));
+        let h = CreateFileW(
+            extended.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            null,
+            CREATE_ALWAYS,
+            0,
+            null,
+        );
+        assert_ne!(
+            h as isize,
+            -1,
+            "CreateFileW failed for extended path under verbatim root: {:?}",
+            translate(&extended[..extended.len() - 1]).map(|v| text(&v))
+        );
+        close(h);
+        assert!(dir.path().join("from_ext.bin").is_file());
+
+        // Dot segments under a verbatim host root must be resolved because
+        // Windows disables path normalization for `\\?\` paths.
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let dotted = w(&format!("{letter}:/sub/../resolved.bin"));
+        let h = CreateFileW(
+            dotted.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            null,
+            CREATE_ALWAYS,
+            0,
+            null,
+        );
+        assert_ne!(
+            h as isize,
+            -1,
+            "CreateFileW failed for dotted path under verbatim root: {:?}",
+            translate(&dotted[..dotted.len() - 1]).map(|v| text(&v))
+        );
+        close(h);
+        assert!(dir.path().join("resolved.bin").is_file());
+    }
+
+    #[test]
+    fn drive_root_mount_does_not_double_separators() {
+        let letter = mount(Path::new(r"C:\")).unwrap();
+        let tr = |s: String| translate(&w(&s)[..s.encode_utf16().count()]).map(|v| text(&v));
+        assert_eq!(tr(format!(r"{letter}:\foo")), Some(r"C:\foo".into()));
+        assert_eq!(tr(format!("{letter}:")), Some(r"C:\".into()));
+        assert_eq!(
+            tr(format!(r"\\?\{letter}:\foo")),
+            Some(r"\\?\C:\foo".into())
+        );
+        assert_eq!(
+            verbatim(&w(r"\\?\C:\")[..7], &w(r"\")[..1]),
+            w(r"\\?\C:\")[..7].to_vec()
+        );
+    }
+
+    #[test]
+    fn disk_free_space_handles_verbatim_and_long_virtual_roots() {
+        assert_eq!(
+            volume_root(&w(r"C:\Users\demo")).map(|v| text(&v)),
+            Some(r"C:\".into())
+        );
+        assert_eq!(
+            volume_root(&w(r"\\?\C:\Users\demo")).map(|v| text(&v)),
+            Some(r"C:\".into())
+        );
+        assert_eq!(
+            volume_root(&w(r"\\?\C:\")).map(|v| text(&v)),
+            Some(r"C:\".into())
+        );
+        assert_eq!(
+            volume_root(&w(r"\\server\share\sub\dir")).map(|v| text(&v)),
+            Some(r"\\server\share\".into())
+        );
+        assert_eq!(
+            volume_root(&w(r"\\?\UNC\server\share\sub")).map(|v| text(&v)),
+            Some(r"\\server\share\".into())
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("a".repeat(160)).join("b".repeat(120));
+        // Create the deep directory on disk so failure cannot be attributed
+        // to a missing folder.
+        std::fs::create_dir_all(format!(r"\\?\{}", deep.display())).unwrap();
+        // Long mount target (>= 248 chars) forces `translate` to emit a `\\?\` path
+        // without a trailing backslash.
+        let long_letter = mount(&deep).unwrap();
+        let (mut spc, mut bps, mut free, mut total) = (0u32, 0u32, 0u32, 0u32);
+        let ok = GetDiskFreeSpaceW(
+            w(&format!(r"{long_letter}:\")).as_ptr(),
+            &mut spc,
+            &mut bps,
+            &mut free,
+            &mut total,
+        );
+        assert_ne!(
+            ok,
+            0,
+            "GetDiskFreeSpaceW failed for existing long mounted root (error {:?})",
+            std::io::Error::last_os_error()
+        );
+        assert!(spc > 0 && bps > 0 && total > 0);
+
+        // Also works when the title passes a verbatim virtual-drive root
+        // (even for a non-existent host subfolder, matching plain `X:\`)
+        // or when the mounted host folder itself has a `\\?\` prefix.
+        let missing_letter = mount(&dir.path().join("not_created_yet")).unwrap();
+        (spc, bps, free, total) = (0, 0, 0, 0);
+        let ok = GetDiskFreeSpaceW(
+            w(&format!(r"\\?\{missing_letter}:\")).as_ptr(),
+            &mut spc,
+            &mut bps,
+            &mut free,
+            &mut total,
+        );
+        assert_ne!(
+            ok,
+            0,
+            "GetDiskFreeSpaceW failed for verbatim root over non-existent host dir (error {:?})",
+            std::io::Error::last_os_error()
+        );
+        assert!(spc > 0 && bps > 0 && total > 0);
+
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        let verb_letter = mount(&canonical).unwrap();
+        for query in [format!(r"\\?\{verb_letter}:\"), format!(r"{verb_letter}:\")] {
+            (spc, bps, free, total) = (0, 0, 0, 0);
+            let ok = GetDiskFreeSpaceW(
+                w(&query).as_ptr(),
+                &mut spc,
+                &mut bps,
+                &mut free,
+                &mut total,
+            );
+            assert_ne!(
+                ok,
+                0,
+                "GetDiskFreeSpaceW failed for {query} (error {:?})",
+                std::io::Error::last_os_error()
+            );
+            assert!(spc > 0 && bps > 0 && total > 0);
+        }
     }
 }
