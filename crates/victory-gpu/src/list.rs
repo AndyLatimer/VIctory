@@ -120,6 +120,16 @@ struct List {
     host: std::sync::Mutex<Option<std::sync::Arc<crate::host::HostList>>>,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
+    /// The host lists recorded before each memory wait since the last
+    /// reset, each with the wait that follows it (see [`wait_value64`]);
+    /// `host` records what follows the last one.
+    #[cfg(windows)]
+    before: std::sync::Mutex<
+        Vec<(
+            std::sync::Arc<crate::host::HostList>,
+            crate::fence::MemoryWait,
+        )>,
+    >,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
@@ -165,6 +175,31 @@ pub(crate) fn host_list(this: This) -> Option<std::sync::Arc<crate::host::HostLi
     // SAFETY: the title passes one of our lists.
     let host = unsafe { &(*this.cast::<List>()).host };
     host.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The host lists a submission of a title list runs, in order, each with
+/// the memory wait that must hold before the next one runs: one per wait
+/// recorded, then the list recording went on in.
+#[cfg(windows)]
+pub(crate) fn host_segments(
+    this: This,
+) -> Vec<(
+    std::sync::Arc<crate::host::HostList>,
+    Option<crate::fence::MemoryWait>,
+)> {
+    if this.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: the title passes one of our lists.
+    let before = unsafe { &(*this.cast::<List>()).before };
+    let mut segments: Vec<_> = before
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(list, wait)| (list.clone(), Some(*wait)))
+        .collect();
+    segments.extend(host_list(this).map(|list| (list, None)));
+    segments
 }
 
 pub(crate) extern "system" fn create_allocator(
@@ -249,6 +284,8 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
         })),
         #[cfg(windows)]
         state: Default::default(),
+        #[cfg(windows)]
+        before: Default::default(),
     });
     object::hand_out(LIST, list, iid, &LIST_IIDS, out)
 }
@@ -318,6 +355,16 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
             _ => (false, false),
         }
     };
+    // The host lists before the list's memory waits: a pending submission
+    // gives them back to the pool once it has run them.
+    #[cfg(windows)]
+    for (before, _) in std::mem::take(&mut *list.before.lock().unwrap_or_else(|e| e.into_inner())) {
+        if let Ok(orphan) = std::sync::Arc::try_unwrap(before)
+            && let Some(host) = crate::host::host()
+        {
+            host.recycle_list(orphan);
+        }
+    }
     #[cfg(windows)]
     with_state(this, |host, state| {
         if !fresh && !keep_pending {
@@ -959,7 +1006,7 @@ extern "system" fn ignored_state(_: This) {}
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, host_list, with_state};
+    use super::{This, with_state};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -981,25 +1028,20 @@ mod state {
         count: u32,
         viewports: *const D3D12_VIEWPORT,
     ) {
-        if let Some(list) = host_list(this) {
-            crate::draw::viewports(&list, items(viewports, count));
-        }
+        with_state(this, |list, s| {
+            s.set_viewports(list, items(viewports, count))
+        });
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
-        if let Some(list) = host_list(this) {
-            crate::draw::scissors(&list, items(rects, count));
-        }
+        with_state(this, |list, s| s.set_scissors(list, items(rects, count)));
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
-        if let Some(list) = host_list(this) {
-            // SAFETY: the title passes four floats or null.
-            crate::draw::blend_factor(&list, unsafe { factor.as_ref() });
-        }
+        // SAFETY: the title passes four floats or null.
+        let factor = unsafe { factor.as_ref() };
+        with_state(this, |list, s| s.set_blend_factor(list, factor));
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
-        if let Some(list) = host_list(this) {
-            crate::draw::stencil_ref(&list, reference);
-        }
+        with_state(this, |list, s| s.set_stencil_ref(list, reference));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
@@ -1269,7 +1311,56 @@ pub(crate) fn take_counts() -> (u64, u64) {
 /// A GPU wait for a memory value `(address, comparison, reference, ...)`.
 /// Lists run one after another and to completion, so a value another queue
 /// or the CPU has to write first cannot be waited for; nothing to do.
-extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _reference: u64) {}
+/// The 32-bit memory wait: its arguments are not known, so nothing waits.
+extern "system" fn wait_value32(_: This, _address: u64, _comparison: u32, _reference: u64) {}
+
+/// The 64-bit memory wait `(address, comparison, reference, flags)`: what
+/// the list records after it runs once the word at `address` compares true
+/// against `reference` (see [`crate::fence::MemoryWait`]). Grand Theft Auto
+/// VI passes flags 0 and 1, whose meaning is not known; they are ignored.
+///
+/// The host list recorded so far is closed, to run before the wait, and
+/// recording goes on in a new one, with the draw state set on it again. A
+/// submission runs each part as its own host submission, and holds the
+/// queue between them until the word compares true (issue #700); the
+/// caller does not wait.
+extern "system" fn wait_value64(
+    this: This,
+    address: u64,
+    comparison: u32,
+    reference: u64,
+    _flags: u32,
+) {
+    #[cfg(windows)]
+    {
+        let Some(wait) = crate::fence::MemoryWait::new(address, comparison, reference) else {
+            return;
+        };
+        if this.is_null() {
+            return;
+        }
+        // SAFETY: the title passes one of our lists.
+        let list = unsafe { &*this.cast::<List>() };
+        {
+            let mut host = list.host.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(done) = host.clone() else { return };
+            let Some(Ok(new)) = crate::host::host().map(|h| h.acquire_list()) else {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!("no new host list: a memory wait is not held"));
+                return;
+            };
+            done.close();
+            *host = Some(std::sync::Arc::new(new));
+            list.before
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((done, wait));
+        }
+        with_state(this, |host, state| state.resume(host));
+    }
+    #[cfg(not(windows))]
+    let _ = (this, address, comparison, reference);
+}
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
@@ -1372,8 +1463,8 @@ const METHODS: [(usize, *const ()); 52] = [
     (68, ignored_state as *const ()),             // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
-    (71, wait_value as *const ()),                // 0x238, 32 bits
-    (72, wait_value as *const ()),                // 0x240, 64 bits
+    (71, wait_value32 as *const ()),              // 0x238, 32 bits
+    (72, wait_value64 as *const ()),              // 0x240, 64 bits
     (73, ignored_state as *const ()),             // 0x248 pixel shader depth order
     (83, copy_texture_region_x as *const ()),     // 0x298
     (84, copy_resource_x as *const ()),           // 0x2a0
@@ -1589,6 +1680,72 @@ mod tests {
         );
 
         for object in [list, allocator, waits, ready, done] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    /// Issue #700: a list's 64-bit memory wait holds what the list records
+    /// after it until another queue's list writes the word, while what it
+    /// records before runs at once. The consumer is submitted first.
+    #[test]
+    fn work_after_a_memory_wait_runs_once_another_queue_writes_the_word() {
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        if crate::host::host().is_none() {
+            return;
+        }
+        type Execute = extern "system" fn(This, u32, *const This);
+        const GREATER_EQUAL: u32 = 7;
+        let null = std::ptr::null();
+        let (consumes, _) = crate::queue::test_queue();
+        let (produces, _) = crate::queue::test_queue();
+        let execute = |q: This, list: This| slot::<Execute>(q, 0x50)(q, 1, &list);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let new_list = || {
+            let mut list = null;
+            assert_eq!(
+                create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+                S_OK
+            );
+            list
+        };
+        // Payload, counter, result (a sentinel), and markers before and
+        // after the wait.
+        let words: Box<[AtomicU64; 5]> = Box::new([0, 0, 0xdead, 0, 0].map(AtomicU64::new));
+        let at = |i: usize| words[i].as_ptr() as u64;
+        let word = |i: usize| words[i].load(SeqCst);
+        let (payload, counter, result, before, after) = (0, 1, 2, 3, 4);
+
+        let consumer = new_list();
+        write64(consumer, at(before), 1, 0, 0);
+        wait_value64(consumer, at(counter), GREATER_EQUAL, 1, 0);
+        copy_memory(consumer, at(result), at(payload), 8, 0);
+        write64(consumer, at(after), 1, 0, 0);
+        assert_eq!(close(consumer), S_OK);
+        let producer = new_list();
+        write64(producer, at(payload), 0x5a55_a11c, 0, 0);
+        write64(producer, at(counter), 2, 0, 0);
+        assert_eq!(close(producer), S_OK);
+
+        execute(consumes, consumer);
+        assert_eq!(word(before), 1, "work before the wait did not run");
+        assert_eq!(word(result), 0xdead, "the copy ran before the wait held");
+        assert_eq!(word(after), 0);
+        execute(produces, producer);
+        // The fence watcher may have seen the word first and be running
+        // the consumer's work on its own thread.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while word(after) == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(word(after), 1);
+        assert_eq!(word(result), 0x5a55_a11c);
+
+        for object in [consumer, producer, allocator, consumes, produces] {
             assert_eq!(release(object), 0);
         }
     }

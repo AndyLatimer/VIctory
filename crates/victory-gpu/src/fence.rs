@@ -123,7 +123,7 @@ fn watch_loop() {
 
 /// Checks every live fence for event or queue waits whose value has been
 /// reached outside `Signal` / bottom-of-pipe writes (for example a CPU write
-/// to the fence's memory).
+/// to the fence's memory), and every list's memory wait.
 fn scan_live_fences() -> (Vec<Arc<Timeline>>, bool) {
     let live = live();
     let mut woken = Vec::new();
@@ -144,6 +144,10 @@ fn scan_live_fences() -> (Vec<Arc<Timeline>>, bool) {
         woken.extend(more);
         any_waiting |= !waiters.is_empty() || !queues.is_empty();
     }
+    drop(live);
+    // Memory waits on words written by the CPU or copied back from shaders.
+    woken.extend(memory_woken(0, usize::MAX));
+    any_waiting |= !memory().is_empty();
     (woken, any_waiting)
 }
 
@@ -240,7 +244,10 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     let fence = fence(this);
     let waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
-    let queues = wake(fence, waiters);
+    let mut queues = wake(fence, waiters);
+    // A list may wait for the value as a word of memory.
+    let at = (&raw const fence.value) as usize;
+    queues.extend(memory_woken(at, at + size_of::<u64>()));
     run_held(queues);
     S_OK
 }
@@ -346,25 +353,153 @@ impl Held {
     }
 }
 
+/// A command list's wait for a 64-bit word of title memory
+/// (`Wait64BitValueX`): what the list records after it runs once
+/// `word <comparison> reference` holds. The comparison is a
+/// `D3D12_COMPARISON_FUNC` (Grand Theft Auto VI passes 7, greater or
+/// equal, for a counter another queue's list writes at its bottom of
+/// pipe), and the whole word is compared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MemoryWait {
+    at: usize,
+    comparison: u32,
+    reference: u64,
+}
+
+const LESS: u32 = 2;
+const EQUAL: u32 = 3;
+const LESS_EQUAL: u32 = 4;
+const GREATER: u32 = 5;
+const NOT_EQUAL: u32 = 6;
+const GREATER_EQUAL: u32 = 7;
+const ALWAYS: u32 = 8;
+
+/// Queues held back by a memory wait, woken by the bottom-of-pipe writes
+/// and signals that touch the word, and by the watcher (other writes). A
+/// leaf lock: taken after a timeline's or `LIVE`, nothing locked under it.
+static MEMORY: Mutex<Vec<(MemoryWait, Weak<Timeline>)>> = Mutex::new(Vec::new());
+
+fn memory() -> MutexGuard<'static, Vec<(MemoryWait, Weak<Timeline>)>> {
+    MEMORY.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl MemoryWait {
+    /// `None` when there is nothing to wait for: a null address, `ALWAYS`,
+    /// or a comparison that would hold the queue forever (`NEVER`) or that
+    /// we do not know (logged).
+    pub(crate) fn new(at: u64, comparison: u32, reference: u64) -> Option<MemoryWait> {
+        match comparison {
+            _ if at == 0 => None,
+            LESS..=GREATER_EQUAL => Some(MemoryWait {
+                at: at as usize,
+                comparison,
+                reference,
+            }),
+            ALWAYS => None,
+            _ => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        comparison,
+                        "memory wait not held: comparison unknown or never true"
+                    )
+                });
+                None
+            }
+        }
+    }
+
+    fn holds(&self, value: u64) -> bool {
+        let r = self.reference;
+        match self.comparison {
+            LESS => value < r,
+            EQUAL => value == r,
+            LESS_EQUAL => value <= r,
+            GREATER => value > r,
+            NOT_EQUAL => value != r,
+            _ => value >= r,
+        }
+    }
+
+    /// Whether the word compares true now; a word we cannot read does not.
+    pub(crate) fn reached(&self) -> bool {
+        load(self.at).is_some_and(|v| self.holds(v))
+    }
+
+    fn touched(&self, at: usize, end: usize) -> bool {
+        self.at < end && at < self.at.saturating_add(size_of::<u64>())
+    }
+
+    /// Whether the word compares true; if not, `queue` is woken once a
+    /// write may have changed that. Checked under the lock the writers
+    /// take after writing, so no write is missed.
+    pub(crate) fn wait_on_gpu(&self, queue: &Arc<Timeline>) -> bool {
+        let mut waits = memory();
+        if self.reached() {
+            return true;
+        }
+        let queue = Arc::downgrade(queue);
+        if !waits.iter().any(|(w, q)| w == self && q.ptr_eq(&queue)) {
+            waits.push((*self, queue));
+        }
+        drop(waits);
+        watch_notify();
+        false
+    }
+}
+
+/// The word at `at`, through the kernel: title memory may be unmapped.
+fn load(at: usize) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        let mut bytes = [0u8; 8];
+        crate::host::read_into(at as *const u8, &mut bytes).then(|| u64::from_le_bytes(bytes))
+    }
+    #[cfg(not(windows))]
+    {
+        // No host GPU, so no host lists and no memory waits.
+        let _ = at;
+        None
+    }
+}
+
+/// The queues whose memory wait on a word in `at..end` now holds; they
+/// leave the registry, as do the waits of dropped queues.
+fn memory_woken(at: usize, end: usize) -> Vec<Arc<Timeline>> {
+    let mut woken = Vec::new();
+    memory().retain(|(wait, queue)| {
+        if queue.strong_count() == 0 {
+            false
+        } else if wait.touched(at, end) && wait.reached() {
+            woken.extend(queue.upgrade());
+            false
+        } else {
+            true
+        }
+    });
+    woken
+}
+
 /// After a bottom-of-pipe write of `bytes` at `at`: wakes the waits of a
-/// fence whose value the write touched, and returns its held queues.
+/// fence whose value the write touched, and returns its held queues and
+/// those whose memory wait the write ended.
 pub(crate) fn written(at: usize, bytes: usize) -> Woken {
     let end = at.saturating_add(bytes);
+    let mut queues = Vec::new();
     let live = live();
-    let Some((&value_at, &fence)) = live.range(..end).next_back() else {
-        return Woken::default();
-    };
-    if value_at + size_of::<u64>() <= at {
-        return Woken::default();
+    if let Some((&value_at, &fence)) = live.range(..end).next_back()
+        && value_at + size_of::<u64>() > at
+    {
+        // SAFETY: registered fences are alive until their drop, which
+        // takes the registry lock we hold.
+        let fence = unsafe { &*(fence as *const Fence) };
+        queues = wake(
+            fence,
+            fence.waiters.lock().unwrap_or_else(|e| e.into_inner()),
+        );
     }
-    // SAFETY: registered fences are alive until their drop, which takes
-    // the registry lock we hold.
-    let fence = unsafe { &*(fence as *const Fence) };
-    let queues = wake(
-        fence,
-        fence.waiters.lock().unwrap_or_else(|e| e.into_inner()),
-    );
     drop(live);
+    queues.extend(memory_woken(at, end));
     Woken(queues)
 }
 

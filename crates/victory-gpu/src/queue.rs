@@ -119,7 +119,9 @@ extern "system" fn release(this: This) -> u32 {
 }
 
 /// Runs the lists' host lists and waits for them (decision 0007), once
-/// the queue's waits before them are reached.
+/// the queue's waits before them are reached. A list's memory waits split
+/// the submission: what follows one runs once it holds (see
+/// [`crate::list::host_segments`]).
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
@@ -129,27 +131,42 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         // Held until they run: the title may reset its lists before.
-        let host_lists: Vec<_> = lists
-            .iter()
-            .filter_map(|&l| crate::list::host_list(l))
-            .collect();
-        queue(this).timeline.submit(Op::Run(Box::new(move || {
-            if let Some(host) = crate::host::host() {
-                let runs: Vec<_> = host_lists.iter().map(|l| &**l).collect();
-                host.execute(&runs);
-                for list in host_lists {
-                    if let Ok(orphan) = std::sync::Arc::try_unwrap(list) {
-                        host.recycle_list(orphan);
-                    }
+        let mut ops = Vec::new();
+        let mut runs = Vec::new();
+        for &list in lists {
+            for (host_list, wait) in crate::list::host_segments(list) {
+                runs.push(host_list);
+                if let Some(wait) = wait {
+                    ops.push(run_lists(std::mem::take(&mut runs)));
+                    ops.push(Op::WaitMemory(wait));
                 }
             }
-        })));
+        }
+        ops.push(run_lists(runs));
+        queue(this).timeline.submit_all(ops);
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);
     if !ONCE.swap(true, Ordering::Relaxed) {
         tracing::warn!(count, "command lists submitted; no host GPU runs them");
     }
+}
+
+/// Runs host lists as one host submission; those no title list holds any
+/// more go back to the pool.
+#[cfg(windows)]
+fn run_lists(host_lists: Vec<std::sync::Arc<crate::host::HostList>>) -> Op {
+    Op::Run(Box::new(move || {
+        if let Some(host) = crate::host::host() {
+            let runs: Vec<_> = host_lists.iter().map(|l| &**l).collect();
+            host.execute(&runs);
+            for list in host_lists {
+                if let Ok(orphan) = std::sync::Arc::try_unwrap(list) {
+                    host.recycle_list(orphan);
+                }
+            }
+        }
+    }))
 }
 
 /// The start of a present plane: frame token, then the plane's resources.

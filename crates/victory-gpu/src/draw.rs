@@ -77,6 +77,14 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// What the title set straight onto the host list, to set again on a
+    /// new one ([`State::resume`]): target handles and depth handle,
+    /// viewports, scissors, blend factor, stencil reference.
+    target_handles: Option<(Vec<u64>, u64)>,
+    viewports: Vec<D3D12_VIEWPORT>,
+    scissors: Vec<RECT>,
+    blend_factor: Option<Option<[f32; 4]>>,
+    stencil_ref: Option<u32>,
 }
 
 impl Drop for State {
@@ -176,6 +184,54 @@ impl State {
         std::mem::take(&mut self.dynamic)
     }
 
+    /// Sets the title's state again on a new host list, which recording
+    /// goes on in after a memory wait: topology, targets and fixed-function
+    /// state now; heaps, root signature and pipeline at the next draw or
+    /// dispatch. Targets are looked up again from the title's handles.
+    pub(crate) fn resume(&mut self, list: &HostList) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+        if self.topology != 0 {
+            self.set_topology(list, self.topology);
+        }
+        if let Some((handles, depth)) = self.target_handles.take() {
+            self.set_targets(list, &handles, depth);
+        }
+        if !self.viewports.is_empty() {
+            viewports(list, &self.viewports);
+        }
+        if !self.scissors.is_empty() {
+            scissors(list, &self.scissors);
+        }
+        if let Some(factor) = self.blend_factor {
+            blend_factor(list, factor.as_ref());
+        }
+        if let Some(reference) = self.stencil_ref {
+            stencil_ref(list, reference);
+        }
+    }
+
+    pub(crate) fn set_viewports(&mut self, list: &HostList, set: &[D3D12_VIEWPORT]) {
+        self.viewports = set.to_vec();
+        viewports(list, set);
+    }
+
+    pub(crate) fn set_scissors(&mut self, list: &HostList, set: &[RECT]) {
+        self.scissors = set.to_vec();
+        scissors(list, set);
+    }
+
+    pub(crate) fn set_blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
+        self.blend_factor = Some(factor.copied());
+        blend_factor(list, factor);
+    }
+
+    pub(crate) fn set_stencil_ref(&mut self, list: &HostList, reference: u32) {
+        self.stencil_ref = Some(reference);
+        stencil_ref(list, reference);
+    }
+
     /// The title's topology; console-only ones become host lists (see
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
@@ -257,6 +313,7 @@ impl State {
         let Some(host) = crate::host::host() else {
             return;
         };
+        self.target_handles = Some((handles.to_vec(), depth));
         self.targets.clear();
         let mut rtvs = Vec::new();
         for &h in handles {
@@ -1167,22 +1224,22 @@ const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
 
 /// Fixed-function state, straight onto the host list.
-pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
     // SAFETY: an open list.
     unsafe { list.list.RSSetViewports(viewports) };
 }
 
-pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
+fn scissors(list: &HostList, rects: &[RECT]) {
     // SAFETY: an open list.
     unsafe { list.list.RSSetScissorRects(rects) };
 }
 
-pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
+fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetBlendFactor(factor) };
 }
 
-pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
+fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
 }

@@ -9,18 +9,24 @@
 //! submitting thread behind a wait, so a thread may submit a queue's wait
 //! before the signal it waits for.
 //!
-//! Locks: a timeline's state is taken before a fence's waiters, never
-//! after; work runs with no lock held.
+//! A command list's memory wait (`Wait64BitValueX`) holds the queue the
+//! same way, until a word of title memory compares true (see
+//! [`MemoryWait`]).
+//!
+//! Locks: a timeline's state is taken before a fence's waiters or the
+//! memory waits, never after; work runs with no lock held.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
-use crate::fence::Held;
+use crate::fence::{Held, MemoryWait};
 
 /// One step of a queue's work.
 pub(crate) enum Op {
     /// Hold back what follows until the fence reaches the value.
     Wait(Held, u64),
+    /// Hold back what follows until a word of memory compares true.
+    WaitMemory(MemoryWait),
     /// Command lists to run, a fence to signal.
     Run(Box<dyn FnOnce() + Send>),
 }
@@ -44,6 +50,17 @@ struct State {
     held: bool,
 }
 
+impl Op {
+    /// Whether nothing holds back what follows the op now.
+    fn reached(&self) -> bool {
+        match self {
+            Op::Wait(fence, value) => fence.reached(*value),
+            Op::WaitMemory(wait) => wait.reached(),
+            Op::Run(_) => true,
+        }
+    }
+}
+
 impl Timeline {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
@@ -53,9 +70,15 @@ impl Timeline {
     /// Work another thread is running for the queue is waited for, as a
     /// submission's own work is.
     pub(crate) fn submit(self: &Arc<Self>, op: Op) {
+        self.submit_all(vec![op]);
+    }
+
+    /// As [`Timeline::submit`], for the steps of one submission: no other
+    /// submission's work comes between them.
+    pub(crate) fn submit_all(self: &Arc<Self>, ops: Vec<Op>) {
         let mut s = self.lock();
-        s.ops.push_back(op);
-        s.pushed += 1;
+        s.pushed += ops.len() as u64;
+        s.ops.extend(ops);
         let ticket = s.pushed;
         while s.busy && s.done < ticket {
             s = self.moved.wait(s).unwrap_or_else(|e| e.into_inner());
@@ -65,10 +88,7 @@ impl Timeline {
         }
         // Still held back unless the value was reached by a path that does
         // not wake us (a CPU write to the fence's memory).
-        if s.held
-            && let Some(Op::Wait(fence, value)) = s.ops.front()
-            && !fence.reached(*value)
-        {
+        if s.held && s.ops.front().is_some_and(|op| !op.reached()) {
             return;
         }
         self.run(s);
@@ -92,6 +112,13 @@ impl Timeline {
                     // signal after this check wakes us.
                     if !fence.wait_on_gpu(value, self) {
                         s.ops.push_front(Op::Wait(fence, value));
+                        s.held = true;
+                        break;
+                    }
+                }
+                Op::WaitMemory(wait) => {
+                    if !wait.wait_on_gpu(self) {
+                        s.ops.push_front(Op::WaitMemory(wait));
                         s.held = true;
                         break;
                     }
